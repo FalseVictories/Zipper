@@ -96,8 +96,13 @@ final public actor Zipper: Sendable {
     
     var bytesInFile: Int64 = 0
     
+    var decompressionFunction: (UInt8) -> Void
+    
     public init(delegate: ZipperDelegate) {
         self.delegate = delegate
+        decompressionFunction = { _ in
+            fatalError("decompressionFunction set to default") // FIXME: This should throw
+        }
     }
     
     public func consume<S: AsyncSequence>(_ iterator: S) async throws where S.Element == UInt8 {
@@ -158,86 +163,7 @@ final public actor Zipper: Sendable {
                 break
                 
             case .decompressData:
-                // Take the front of the prebuffer and put it into the decompression buffer
-                if decompressionPreBuffer.count == 4 {
-                    let decompressValue = decompressionPreBuffer.peek()
-                    decompressionBuffer[decompressionPosition] = decompressValue
-                    decompressionPosition += 1
-                    bytesInFile += 1
-                }
-                
-                // push the newest byte into the prebuffer
-                decompressionPreBuffer.push(byte)
-                                
-                // Check if there's a header value that means decompression should end
-                let totalValue = decompressionPreBuffer.totalValue
-                var headerType = parsePKHeader(totalValue)
-                
-                if headerType != .none {
-                    if let currentHeader {
-                        if currentHeader.dataLength == 0 {
-                            if headerType != .dataDescriptor {
-                                headerType = .none
-                            }
-                        } else {
-                            if bytesInFile != currentHeader.dataLength {
-                                headerType = .none
-                            }
-                        }
-                    }
-                }
-                                
-                // Pass a buffer to the decompressor when it's full or it's the last buffer
-                if decompressionPosition >= Zipper.bufferSize || headerType != .none {
-                    let dataBuffer = Data(bytesNoCopy: decompressionBuffer,
-                                          count: decompressionPosition,
-                                          deallocator: .none)
-                    if currentHeader?.compression == 0 {
-                        delegate.writeData(dataBuffer, bytesDownloaded)
-                    } else if currentHeader?.compression == 8 {
-                        decompress(data: dataBuffer, finished: decompressionPosition < Zipper.bufferSize)
-                    } else {
-                        delegate.errorDidOccur(.unknownEncryption)
-                        currentState = .finished
-                        
-                        tearDownDecompressor()
-                        
-                        return
-                    }
-                    
-                    decompressionPosition = 0
-                }
-                
-                if headerType != .none {
-                    delegate.endWritingFile()
-                    tearDownDecompressor()
-                    
-                    bytesInFile = 0
-                    
-                    switch headerType {
-                    case .none:
-                        break
-                        
-                    case .localFile:
-                        fillLocalHeader()
-                        break
-                        
-                    case .dataDescriptor:
-                        skipDataDescriptor()
-                        break
-                        
-                    case .archiveExtraData:
-                        currentState = .finished
-                        break
-                        
-                    case .centralDirectory:
-                        currentState = .finished
-                        break
-                    }
-                    
-                    break
-                }
-
+                decompressionFunction(byte)
                 break
                 
             case .finished:
@@ -347,6 +273,8 @@ private extension Zipper {
         
         filename = ""
         currentState = .readFileName
+        
+        decompressionFunction = dataLength == 0 ? extractLengthUnknown : extractLengthKnown
     }
     
     func decideWhatToDoAfterSkippingExtraData() {
@@ -412,6 +340,127 @@ private extension Zipper {
             streamPointer.deallocate()
         }
         streamPointer = nil
+    }
+    
+    func extractLengthKnown(_ byte: UInt8) {
+        guard let currentHeader else {
+            return // Should throw?
+        }
+        
+        decompressionBuffer[decompressionPosition] = byte
+        decompressionPosition += 1
+        bytesInFile += 1
+        
+        if decompressionPosition >= Zipper.bufferSize || bytesInFile == currentHeader.dataLength {
+            let dataBuffer = Data(bytesNoCopy: decompressionBuffer,
+                                  count: decompressionPosition,
+                                  deallocator: .none)
+            if currentHeader.compression == 0 {
+                delegate.writeData(dataBuffer, bytesDownloaded)
+            } else if currentHeader.compression == 8 {
+                decompress(data: dataBuffer, finished: decompressionPosition < Zipper.bufferSize)
+            } else {
+                delegate.errorDidOccur(.unknownEncryption)
+                currentState = .finished
+                
+                tearDownDecompressor()
+                
+                return
+            }
+            
+            decompressionPosition = 0
+        }
+
+        if bytesInFile == currentHeader.dataLength {
+            delegate.endWritingFile()
+            tearDownDecompressor()
+            
+            bytesInFile = 0
+            
+            currentState = .fillingBuffer(parsePKEntryHeader(from:))
+            bytesToFill = 4
+            bufferFillPosition = 0
+        }
+    }
+    
+    func extractLengthUnknown(_ byte: UInt8) {
+        // Take the front of the prebuffer and put it into the decompression buffer
+        if decompressionPreBuffer.count == 4 {
+            let decompressValue = decompressionPreBuffer.peek()
+            decompressionBuffer[decompressionPosition] = decompressValue
+            decompressionPosition += 1
+            bytesInFile += 1
+        }
+        
+        // push the newest byte into the prebuffer
+        decompressionPreBuffer.push(byte)
+                        
+        // Check if there's a header value that means decompression should end
+        let totalValue = decompressionPreBuffer.totalValue
+        var headerType = parsePKHeader(totalValue)
+        
+        if headerType != .none {
+            if let currentHeader {
+                if currentHeader.dataLength == 0 {
+                    if headerType != .dataDescriptor {
+                        headerType = .none
+                    }
+                } else {
+                    if bytesInFile != currentHeader.dataLength {
+                        headerType = .none
+                    }
+                }
+            }
+        }
+                        
+        // Pass a buffer to the decompressor when it's full or it's the last buffer
+        if decompressionPosition >= Zipper.bufferSize || headerType != .none {
+            let dataBuffer = Data(bytesNoCopy: decompressionBuffer,
+                                  count: decompressionPosition,
+                                  deallocator: .none)
+            if currentHeader?.compression == 0 {
+                delegate.writeData(dataBuffer, bytesDownloaded)
+            } else if currentHeader?.compression == 8 {
+                decompress(data: dataBuffer, finished: decompressionPosition < Zipper.bufferSize)
+            } else {
+                delegate.errorDidOccur(.unknownEncryption)
+                currentState = .finished
+                
+                tearDownDecompressor()
+                
+                return
+            }
+            
+            decompressionPosition = 0
+        }
+        
+        if headerType != .none {
+            delegate.endWritingFile()
+            tearDownDecompressor()
+            
+            bytesInFile = 0
+            
+            switch headerType {
+            case .none:
+                break
+                
+            case .localFile:
+                fillLocalHeader()
+                break
+                
+            case .dataDescriptor:
+                skipDataDescriptor()
+                break
+                
+            case .archiveExtraData:
+                currentState = .finished
+                break
+                
+            case .centralDirectory:
+                currentState = .finished
+                break
+            }
+        }
     }
     
     func decompress(data buffer: Data, finished: Bool) {
