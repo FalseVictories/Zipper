@@ -94,6 +94,8 @@ final public actor Zipper: Sendable {
     
     var bytesDownloaded: Int64 = 0
     
+    var bytesInFile: Int64 = 0
+    
     public init(delegate: ZipperDelegate) {
         self.delegate = delegate
     }
@@ -161,6 +163,7 @@ final public actor Zipper: Sendable {
                     let decompressValue = decompressionPreBuffer.peek()
                     decompressionBuffer[decompressionPosition] = decompressValue
                     decompressionPosition += 1
+                    bytesInFile += 1
                 }
                 
                 // push the newest byte into the prebuffer
@@ -168,8 +171,22 @@ final public actor Zipper: Sendable {
                                 
                 // Check if there's a header value that means decompression should end
                 let totalValue = decompressionPreBuffer.totalValue
-                let headerType = parsePKHeader(totalValue)
+                var headerType = parsePKHeader(totalValue)
                 
+                if headerType != .none {
+                    if let currentHeader {
+                        if currentHeader.dataLength == 0 {
+                            if headerType != .dataDescriptor {
+                                headerType = .none
+                            }
+                        } else {
+                            if bytesInFile != currentHeader.dataLength {
+                                headerType = .none
+                            }
+                        }
+                    }
+                }
+                                
                 // Pass a buffer to the decompressor when it's full or it's the last buffer
                 if decompressionPosition >= Zipper.bufferSize || headerType != .none {
                     let dataBuffer = Data(bytesNoCopy: decompressionBuffer,
@@ -193,8 +210,9 @@ final public actor Zipper: Sendable {
                 
                 if headerType != .none {
                     delegate.endWritingFile()
-                    
                     tearDownDecompressor()
+                    
+                    bytesInFile = 0
                     
                     switch headerType {
                     case .none:
@@ -239,6 +257,7 @@ private extension Zipper {
         
         bufferFillPosition = 0
         bytesToFill = 4
+        bytesInFile = 0
         
         currentState = .fillingBuffer(parsePKEntryHeader(from:))
         currentHeader = nil
@@ -315,7 +334,7 @@ private extension Zipper {
         let filenameLength = extractUInt16(from: dataBuffer, at: 22)
         let extraHeaderLength = extractUInt16(from: dataBuffer, at: 24)
         
-        currentHeader = LocalFileHeader(compression: compression, 
+        currentHeader = LocalFileHeader(compression: compression,
                                         flags: flags,
                                         dataLength: dataLength,
                                         decompressedLength: decompressedLength,
