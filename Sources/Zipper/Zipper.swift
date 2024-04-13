@@ -48,7 +48,7 @@ final public actor Zipper: Sendable {
     
     enum State {
         case none
-        case fillingBuffer((Data) -> Void)
+        case fillingBuffer((UnsafeMutablePointer<UInt8>, Int) -> Void)
         case readFileName
         case skipBytes(() -> Void)
         case decompressData
@@ -74,7 +74,7 @@ final public actor Zipper: Sendable {
     
     var currentState: State = .none
     
-    var dataBuffer: Data = Data()
+    var dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
     
     var decompressionPreBuffer = RingBuffer()
     var decompressionBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Zipper.bufferSize)
@@ -106,7 +106,7 @@ final public actor Zipper: Sendable {
     }
     
     public func consume<S: AsyncSequence>(_ iterator: S) async throws where S.Element == UInt8 {
-        currentState = .fillingBuffer(parsePKEntryHeader(from:))
+        currentState = .fillingBuffer(parsePKEntryHeader)
         bytesToFill = 4
         bufferFillPosition = 0
 
@@ -121,14 +121,14 @@ final public actor Zipper: Sendable {
             
             case .fillingBuffer(let completion):
                 if bytesToFill > 0 {
-                    dataBuffer.insert(byte, at: bufferFillPosition)
+                    dataBuffer[bufferFillPosition] = byte
                     bufferFillPosition += 1
                     bytesToFill -= 1
                 }
                 
                 if bytesToFill == 0 {
                     currentState = .none
-                    completion(dataBuffer)
+                    completion(dataBuffer, bufferFillPosition)
                 }
                 
                 break
@@ -179,20 +179,22 @@ final public actor Zipper: Sendable {
 private extension Zipper {
     func resetForNextEntry() {
         filename = ""
-        dataBuffer.removeAll()
+        dataBuffer.deallocate()
         
         bufferFillPosition = 0
         bytesToFill = 4
+        dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
         bytesInFile = 0
         
-        currentState = .fillingBuffer(parsePKEntryHeader(from:))
+        currentState = .fillingBuffer(parsePKEntryHeader)
         currentHeader = nil
     }
     
     func fillLocalHeader() {
         bytesToFill = 26
         bufferFillPosition = 0
-        currentState = .fillingBuffer(parseLocalFileHeader(from:))
+        dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 26)
+        currentState = .fillingBuffer(parseLocalFileHeader)
     }
     
     func parsePKHeader(_ header: UInt32) -> HeaderType {
@@ -218,8 +220,8 @@ private extension Zipper {
         }
     }
     
-    func parsePKEntryHeader(from data: Data) {
-        guard data.count == 4 else {
+    func parsePKEntryHeader(from data: UnsafeMutablePointer<UInt8>, count: Int) {
+        guard count == 4 else {
             return
         }
         
@@ -252,7 +254,7 @@ private extension Zipper {
         currentState = .skipBytes(resetForNextEntry)
     }
     
-    func parseLocalFileHeader(from data: Data) {
+    func parseLocalFileHeader(from data: UnsafeMutablePointer<UInt8>, count: Int) {
         let flags = extractUInt16(from: dataBuffer, at: 2)
         let compression = extractUInt16(from: dataBuffer, at: 4)
         let dataLength = extractUInt32(from: dataBuffer, at: 14)
@@ -267,7 +269,8 @@ private extension Zipper {
                                         fileNameLength: filenameLength,
                                         extraDataLength: extraHeaderLength)
         
-        dataBuffer.removeAll()
+        dataBuffer.deallocate()
+        
         bytesToFill = Int(filenameLength)
         bufferFillPosition = 0
         
@@ -302,7 +305,6 @@ private extension Zipper {
             }
         }
 
-        dataBuffer.removeAll()
         delegate.beginWritingFile(filename)
         decompressionPreBuffer.clear()
                 
@@ -377,7 +379,8 @@ private extension Zipper {
             
             bytesInFile = 0
             
-            currentState = .fillingBuffer(parsePKEntryHeader(from:))
+            currentState = .fillingBuffer(parsePKEntryHeader)
+            dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
             bytesToFill = 4
             bufferFillPosition = 0
         }
@@ -516,7 +519,7 @@ private extension Zipper {
         } while status == COMPRESSION_STATUS_OK
     }
     
-    func extractUInt16(from data: Data, at position: Int) -> UInt16 {
+    func extractUInt16(from data: UnsafeMutablePointer<UInt8>, at position: Int) -> UInt16 {
         var value: UInt16 = 0
         value = UInt16(data[position + 1])
         value = value << 8
@@ -524,7 +527,7 @@ private extension Zipper {
         return value
     }
     
-    func extractUInt32(from data: Data, at position: Int) -> UInt32 {
+    func extractUInt32(from data: UnsafeMutablePointer<UInt8>, at position: Int) -> UInt32 {
         var value: UInt32 = 0
         
         value = UInt32(data[position + 3]) << 24
