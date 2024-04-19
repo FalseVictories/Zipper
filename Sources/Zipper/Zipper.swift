@@ -20,14 +20,14 @@ public enum ZipperError: Error {
 // Marked as @unchecked as I'm not sure how to make it Sendable. None of the data passed into the
 // closures should be accessed from multiple threads anyway
 public struct ZipperDelegate: @unchecked Sendable {
-    var createFolder: (String) -> Void
-    var beginWritingFile: (String) -> Void
-    var writeData: (Data, Int64) -> Void
-    var endWritingFile: () -> Void
+    var createFolder: (String) throws -> Void
+    var beginWritingFile: (String) throws -> Void
+    var writeData: (Data, Int64) throws -> Void
+    var endWritingFile: () throws -> Void
     var didFinish: () -> Void
     var errorDidOccur: (ZipperError) -> Void
     
-    public init(createFolder: @escaping (String) -> Void, 
+    public init(createFolder: @escaping (String) -> Void,
                 beginWritingFile: @escaping (String) -> Void,
                 writeData: @escaping (Data, Int64) -> Void,
                 endWritingFile: @escaping () -> Void,
@@ -42,18 +42,40 @@ public struct ZipperDelegate: @unchecked Sendable {
     }
 }
 
-final public actor Zipper: Sendable {
-    static let LocalHeaderSize = 26
-    static let bufferSize = 32_768
-    
-    enum State {
+struct LocalFileHeader {
+    let compression: UInt16
+    let flags: UInt16
+    let dataLength: UInt32
+    let decompressedLength: UInt32
+    let fileNameLength: UInt16
+    let extraDataLength: UInt16
+}
+
+final class Context {
+    enum BufferState {
         case none
-        case fillingBuffer((UnsafeMutablePointer<UInt8>, Int) -> Void)
-        case readFileName
-        case skipBytes(() -> Void)
-        case decompressData
+        case fillWorkBuffer((Context, Data) -> Void)
+        case skippingData((Context) throws -> Void)
+        case unpackData
         case finished
     }
+    
+    var currentState: BufferState = .none
+    
+    var bytesToFillOrSkip: UInt32 = 0
+    var workBufferOffset: Int = 0
+    var workBuffer: Data?
+    
+    var currentFileHeader: LocalFileHeader?
+    var currentFilename = ""
+}
+
+/// Unpack a zip file on the fly
+final public actor Zipper: Sendable {
+    static let PKHeaderSize: UInt32 = 4
+    static let LocalHeaderSize: UInt32 = 26
+    static let DataDescriptorSize: UInt32 = 12
+    static let BufferSize = 65536
     
     enum HeaderType {
         case none
@@ -63,145 +85,211 @@ final public actor Zipper: Sendable {
         case centralDirectory
     }
     
-    struct LocalFileHeader {
-        let compression: UInt16
-        let flags: UInt16
-        let dataLength: UInt32
-        let decompressedLength: UInt32
-        let fileNameLength: UInt16
-        let extraDataLength: UInt16
-    }
-    
-    var currentState: State = .none
-    
-    var dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
-    
-    var decompressionPreBuffer = RingBuffer()
-    var decompressionBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Zipper.bufferSize)
-    var decompressionPosition: Int = 0
-    
-    var bufferFillPosition: Int = 0
-    var bytesToFill: Int = 0
-    var bytesToSkip: Int = 0
-    
-    var currentHeader: LocalFileHeader?
-    var filename: String = ""
-    
-    var delegate: ZipperDelegate
-    
-    var destinationBufferPointer: UnsafeMutablePointer<UInt8>?
-    var streamPointer: UnsafeMutablePointer<compression_stream>?
-    
-    var bytesDownloaded: Int64 = 0
-    
-    var bytesInFile: Int64 = 0
-    
-    var decompressionFunction: (UInt8) -> Void
-    
+    let delegate: ZipperDelegate
+
     public init(delegate: ZipperDelegate) {
         self.delegate = delegate
-        decompressionFunction = { _ in
-            fatalError("decompressionFunction set to default") // FIXME: This should throw
+    }
+    
+    public func consume<S: AsyncSequence>(_ iterator: S) async throws where S.Element == Data {
+        let context = Context()
+        resetForNextEntry(with: context)
+        
+        for try await buffer in iterator {
+            try parseBuffer(buffer, with: context)
         }
     }
     
     public func consume<S: AsyncSequence>(_ iterator: S) async throws where S.Element == UInt8 {
-        currentState = .fillingBuffer(parsePKEntryHeader)
-        bytesToFill = 4
-        bufferFillPosition = 0
-
-    byteIterator:
+        let context = Context()
+        resetForNextEntry(with: context)
+        
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Zipper.BufferSize)
+        
+        var offset = 0
         for try await byte in iterator {
-            bytesDownloaded += 1
+            buffer[offset] = byte
+            offset += 1
             
-            switch currentState {
-            case .none:
-                delegate.errorDidOccur(.invalidState)
-                return
-            
-            case .fillingBuffer(let completion):
-                if bytesToFill > 0 {
-                    dataBuffer[bufferFillPosition] = byte
-                    bufferFillPosition += 1
-                    bytesToFill -= 1
-                }
+            if offset >= Zipper.BufferSize {
+                let dataBuffer = Data(bytesNoCopy: buffer,
+                                      count: offset,
+                                      deallocator: .none)
                 
-                if bytesToFill == 0 {
-                    currentState = .none
-                    completion(dataBuffer, bufferFillPosition)
-                }
-                
-                break
-
-            case .readFileName:
-                guard let currentHeader else {
-                    delegate.errorDidOccur(.invalidArchive)
-                    return
-                }
-                
-                if bytesToFill > 0 {
-                    filename.append(Character(UnicodeScalar(byte)))
-                    bufferFillPosition += 1
-                    bytesToFill -= 1
-                }
-                
-                if bytesToFill == 0 {
-                    bytesToSkip = Int(currentHeader.extraDataLength)
-                    currentState = .skipBytes(decideWhatToDoAfterSkippingExtraData)
-                }
-                break
-                
-            case .skipBytes(let completion):
-                if bytesToSkip > 0 {
-                    bytesToSkip -= 1
-                }
-                
-                if bytesToSkip == 0 {
-                    currentState = .none
-                    completion()
-                }
-                break
-                
-            case .decompressData:
-                decompressionFunction(byte)
-                break
-                
-            case .finished:
-                break byteIterator
+                try parseBuffer(dataBuffer, with: context)
+                offset = 0
             }
         }
         
-        decompressionBuffer.deallocate()
-        delegate.didFinish()
+        let dataBuffer = Data(bytesNoCopy: buffer,
+                              count: offset,
+                              deallocator: .none)
+        
+        try parseBuffer(dataBuffer, with: context)
+        offset = 0
     }
 }
 
 private extension Zipper {
-    func resetForNextEntry() {
-        filename = ""
-        dataBuffer.deallocate()
+    func parseBuffer(_ currentBuffer: Data,
+                     with context: Context) throws {
+        var bufferOffset = 0
         
-        bufferFillPosition = 0
-        bytesToFill = 4
-        dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
-        bytesInFile = 0
-        
-        currentState = .fillingBuffer(parsePKEntryHeader)
-        currentHeader = nil
+        while bufferOffset < currentBuffer.count {
+            switch context.currentState {
+            case .none:
+                throw ZipperError.invalidArchive
+                
+            case .fillWorkBuffer(let parseBuffer):
+                bufferOffset = try fillWorkBuffer(from: currentBuffer,
+                                                  at: bufferOffset,
+                                                  with: context)
+                
+                if context.bytesToFillOrSkip == 0 {
+                    if let workBuffer = context.workBuffer {
+                        context.workBuffer = nil
+                        context.workBufferOffset = 0
+                        
+                        parseBuffer(context, workBuffer)
+                    }
+                }
+                
+            case .skippingData(let moveToNextState):
+                bufferOffset = skipData(from: currentBuffer,
+                                        at: bufferOffset,
+                                        with: context)
+                
+                if context.bytesToFillOrSkip == 0 {
+                    try moveToNextState(context)
+                }
+                
+            case .unpackData:
+                bufferOffset = try unpackData(from: currentBuffer,
+                                              at: bufferOffset,
+                                              with: context)
+                
+                if context.bytesToFillOrSkip == 0 {
+                    try delegate.endWritingFile()
+                    
+                    resetForNextEntry(with: context)
+                }
+                
+            case .finished:
+                delegate.didFinish()
+                return // FIXME: maybe?
+            }
+        }
     }
     
-    func fillLocalHeader() {
-        bytesToFill = 26
-        bufferFillPosition = 0
-        dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 26)
-        currentState = .fillingBuffer(parseLocalFileHeader)
+    func fillWorkBuffer(from currentBuffer: Data,
+                        at offset: Int,
+                        with context: Context) throws -> Int {
+        guard var workBuffer = context.workBuffer else {
+            throw ZipperError.invalidState
+        }
+        
+        let bytesFromCurrentBuffer  = Int(min(UInt32(currentBuffer.count - offset),
+                                              context.bytesToFillOrSkip))
+        for idx in 0..<bytesFromCurrentBuffer {
+            workBuffer.insert(currentBuffer[offset + idx], at: context.workBufferOffset)
+            context.workBufferOffset += 1
+            context.bytesToFillOrSkip -= 1
+        }
+        
+        return offset + bytesFromCurrentBuffer
+    }
+    
+    func skipData(from currentBuffer: Data,
+                  at offset: Int,
+                  with context: Context) -> Int {
+        let bytesFromCurrentBuffer = min(UInt32(currentBuffer.count - offset),
+                                         context.bytesToFillOrSkip)
+        context.bytesToFillOrSkip -= bytesFromCurrentBuffer
+        
+        return offset + Int(bytesFromCurrentBuffer)
+    }
+    
+    func unpackData(from currentBuffer: Data,
+                    at offset: Int,
+                    with context: Context) throws -> Int {
+        let bytesFromCurrentBuffer = min(UInt32(currentBuffer.count - offset),
+                                         context.bytesToFillOrSkip)
+        context.bytesToFillOrSkip -= bytesFromCurrentBuffer
+        var buffer: Data
+        if bytesFromCurrentBuffer == currentBuffer.count {
+            buffer = currentBuffer
+        } else {
+            buffer = currentBuffer.subdata(in: offset..<Int(offset + Int(bytesFromCurrentBuffer)))
+        }
+        try delegate.writeData(buffer, 0)
+        
+        return offset + Int(bytesFromCurrentBuffer)
+    }
+    
+    func handlePKHeader(with context: Context,
+                        from workBuffer: Data) {
+        let header = extractUInt32(from: workBuffer, at: 0)
+        let headerType = parsePKHeader(header)
+        
+        switch headerType {
+        case .none, .archiveExtraData, .centralDirectory:
+            context.currentState = .finished
+            
+        case .localFile:
+            fillLocalHeader(with: context)
+            
+        case .dataDescriptor:
+            setupSkipDataDescriptor(with: context)
+        }
+    }
+    
+    func resetForNextEntry(with context: Context) {
+        context.currentFilename = ""
+        context.currentState = .fillWorkBuffer(handlePKHeader)
+        context.bytesToFillOrSkip = Zipper.PKHeaderSize
+        context.workBuffer = Data()
+        context.workBufferOffset = 0
+        context.currentFileHeader = nil
+    }
+        
+    func setupFillBuffer(ofSize size: UInt32,
+                         with context: Context,
+                         parseFunction: @escaping (Context, Data) -> Void) {
+        context.bytesToFillOrSkip = size
+        context.workBuffer = Data()
+        context.workBufferOffset = 0
+        context.currentState = .fillWorkBuffer(parseFunction)
+    }
+    
+    func setupSkipBuffer(ofSize size: UInt32,
+                         with context: Context,
+                         moveToNextStateFunction: @escaping (Context) throws -> Void) {
+        context.bytesToFillOrSkip = size
+        context.currentState = .skippingData(moveToNextStateFunction)
+    }
+    
+    func setupUnpackBuffer(ofSize size: UInt32,
+                           with context: Context) -> Void {
+        context.bytesToFillOrSkip = size
+        context.currentState = .unpackData
+    }
+    
+    func setupSkipDataDescriptor(with context: Context) {
+        context.bytesToFillOrSkip = Zipper.DataDescriptorSize
+        context.currentState = .skippingData(resetForNextEntry)
+    }
+
+    func fillLocalHeader(with context: Context) {
+        setupFillBuffer(ofSize: Zipper.LocalHeaderSize,
+                        with: context,
+                        parseFunction: parseLocalFileHeader)
     }
     
     func parsePKHeader(_ header: UInt32) -> HeaderType {
         if header & 0x4b50 != 0x4b50 {
             return .none
         }
-
+        
         switch header {
         case 0x04034b50:
             return .localFile
@@ -219,321 +307,73 @@ private extension Zipper {
             return .none
         }
     }
+        
+    func parseLocalFileHeader(with context: Context, data: Data) {
+        let flags = extractUInt16(from: data, at: 2)
+        let compression = extractUInt16(from: data, at: 4)
+        let dataLength = extractUInt32(from: data, at: 14)
+        let decompressedLength = extractUInt32(from: data, at: 18)
+        let filenameLength = extractUInt16(from: data, at: 22)
+        let extraHeaderLength = extractUInt16(from: data, at: 24)
+        
+        context.currentFileHeader = LocalFileHeader(compression: compression,
+                                                    flags: flags,
+                                                    dataLength: dataLength,
+                                                    decompressedLength: decompressedLength,
+                                                    fileNameLength: filenameLength,
+                                                    extraDataLength: extraHeaderLength)
+        
+        setupFillBuffer(ofSize: UInt32(filenameLength),
+                        with: context,
+                        parseFunction: parseFilename)
+        context.currentFilename = ""
+        
+        // FIXME
+//        decompressionFunction = dataLength == 0 ? extractLengthUnknown : extractLengthKnown
+    }
     
-    func parsePKEntryHeader(from data: UnsafeMutablePointer<UInt8>, count: Int) {
-        guard count == 4 else {
-            return
+    func parseFilename(with context: Context, buffer: Data) {
+        guard let currentHeader = context.currentFileHeader else {
+            fatalError("No header")
         }
         
-        let headerValue = extractUInt32(from: data, at: 0)
-        switch parsePKHeader(headerValue) {
-        case .none:
-            currentState = .finished
-            break
-            
-        case .localFile:
-            fillLocalHeader()
-            break
-            
-        case .dataDescriptor:
-            skipDataDescriptor()
-            break
-            
-        case .archiveExtraData:
-            currentState = .finished
-            break
-            
-        case .centralDirectory:
-            currentState = .finished
-            break
-        }
+        context.currentFilename = String(decoding: buffer, as: UTF8.self)
+
+        setupSkipBuffer(ofSize: UInt32(currentHeader.extraDataLength),
+                        with: context,
+                        moveToNextStateFunction: decideWhatToDoAfterSkippingExtraData)
     }
     
-    func skipDataDescriptor() {
-        bytesToSkip = 12
-        currentState = .skipBytes(resetForNextEntry)
-    }
-    
-    func parseLocalFileHeader(from data: UnsafeMutablePointer<UInt8>, count: Int) {
-        let flags = extractUInt16(from: dataBuffer, at: 2)
-        let compression = extractUInt16(from: dataBuffer, at: 4)
-        let dataLength = extractUInt32(from: dataBuffer, at: 14)
-        let decompressedLength = extractUInt32(from: dataBuffer, at: 18)
-        let filenameLength = extractUInt16(from: dataBuffer, at: 22)
-        let extraHeaderLength = extractUInt16(from: dataBuffer, at: 24)
-        
-        currentHeader = LocalFileHeader(compression: compression,
-                                        flags: flags,
-                                        dataLength: dataLength,
-                                        decompressedLength: decompressedLength,
-                                        fileNameLength: filenameLength,
-                                        extraDataLength: extraHeaderLength)
-        
-        dataBuffer.deallocate()
-        
-        bytesToFill = Int(filenameLength)
-        bufferFillPosition = 0
-        
-        filename = ""
-        currentState = .readFileName
-        
-        decompressionFunction = dataLength == 0 ? extractLengthUnknown : extractLengthKnown
-    }
-    
-    func decideWhatToDoAfterSkippingExtraData() {
-        guard let currentHeader else {
-            delegate.errorDidOccur(.invalidArchive)
+    func decideWhatToDoAfterSkippingExtraData(context: Context) throws {
+        guard let currentHeader = context.currentFileHeader else {
+            // FIXME: throw error
             return
         }
         
         if currentHeader.dataLength == 0 && currentHeader.flags == 0 {
-            delegate.createFolder(filename)
-            resetForNextEntry()
+            try delegate.createFolder(context.currentFilename)
+            // reset for next entry
             return
         }
         
-        // Only need to initialise the decompressor if compression is used
-        if currentHeader.compression == 8 {
-            if !setUpDecompressor() {
-                // Tear down anything that was already set up before failure
-                tearDownDecompressor()
-                
-                delegate.errorDidOccur(.invalidCompressor)
-                
-                currentState = .finished
-                return
-            }
-        }
-
-        delegate.beginWritingFile(filename)
-        decompressionPreBuffer.clear()
-                
-        currentState = .decompressData
+        try delegate.beginWritingFile(context.currentFilename)
+        setupUnpackBuffer(ofSize: currentHeader.dataLength, with: context)
     }
-    
-    func setUpDecompressor() -> Bool {
-        destinationBufferPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: Zipper.bufferSize)
         
-        streamPointer = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
-        guard let streamPointer else {
-            return false
-        }
-        
-        let status = compression_stream_init(streamPointer, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
-        guard status != COMPRESSION_STATUS_ERROR else {
-            return false
-        }
-        
-        streamPointer.pointee.src_size = 0
-        streamPointer.pointee.dst_ptr = destinationBufferPointer!
-        streamPointer.pointee.dst_size = Zipper.bufferSize
-        
-        return true
-    }
-    
-    func tearDownDecompressor() {
-        if let destinationBufferPointer {
-            destinationBufferPointer.deallocate()
-        }
-        destinationBufferPointer = nil
-        
-        if let streamPointer {
-            compression_stream_destroy(streamPointer)
-            streamPointer.deallocate()
-        }
-        streamPointer = nil
-    }
-    
-    func extractLengthKnown(_ byte: UInt8) {
-        guard let currentHeader else {
-            return // Should throw?
-        }
-        
-        decompressionBuffer[decompressionPosition] = byte
-        decompressionPosition += 1
-        bytesInFile += 1
-        
-        if decompressionPosition >= Zipper.bufferSize || bytesInFile == currentHeader.dataLength {
-            let dataBuffer = Data(bytesNoCopy: decompressionBuffer,
-                                  count: decompressionPosition,
-                                  deallocator: .none)
-            if currentHeader.compression == 0 {
-                delegate.writeData(dataBuffer, bytesDownloaded)
-            } else if currentHeader.compression == 8 {
-                decompress(data: dataBuffer, finished: decompressionPosition < Zipper.bufferSize)
-            } else {
-                delegate.errorDidOccur(.unknownEncryption)
-                currentState = .finished
-                
-                tearDownDecompressor()
-                
-                return
-            }
-            
-            decompressionPosition = 0
-        }
-
-        if bytesInFile == currentHeader.dataLength {
-            delegate.endWritingFile()
-            tearDownDecompressor()
-            
-            bytesInFile = 0
-            
-            currentState = .fillingBuffer(parsePKEntryHeader)
-            dataBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
-            bytesToFill = 4
-            bufferFillPosition = 0
-        }
-    }
-    
-    func extractLengthUnknown(_ byte: UInt8) {
-        // Take the front of the prebuffer and put it into the decompression buffer
-        if decompressionPreBuffer.count == 4 {
-            let decompressValue = decompressionPreBuffer.peek()
-            decompressionBuffer[decompressionPosition] = decompressValue
-            decompressionPosition += 1
-            bytesInFile += 1
-        }
-        
-        // push the newest byte into the prebuffer
-        decompressionPreBuffer.push(byte)
-                        
-        // Check if there's a header value that means decompression should end
-        let totalValue = decompressionPreBuffer.totalValue
-        var headerType = parsePKHeader(totalValue)
-        
-        if headerType != .none {
-            if let currentHeader {
-                if currentHeader.dataLength == 0 {
-                    if headerType != .dataDescriptor {
-                        headerType = .none
-                    }
-                } else {
-                    if bytesInFile != currentHeader.dataLength {
-                        headerType = .none
-                    }
-                }
-            }
-        }
-                        
-        // Pass a buffer to the decompressor when it's full or it's the last buffer
-        if decompressionPosition >= Zipper.bufferSize || headerType != .none {
-            let dataBuffer = Data(bytesNoCopy: decompressionBuffer,
-                                  count: decompressionPosition,
-                                  deallocator: .none)
-            if currentHeader?.compression == 0 {
-                delegate.writeData(dataBuffer, bytesDownloaded)
-            } else if currentHeader?.compression == 8 {
-                decompress(data: dataBuffer, finished: decompressionPosition < Zipper.bufferSize)
-            } else {
-                delegate.errorDidOccur(.unknownEncryption)
-                currentState = .finished
-                
-                tearDownDecompressor()
-                
-                return
-            }
-            
-            decompressionPosition = 0
-        }
-        
-        if headerType != .none {
-            delegate.endWritingFile()
-            tearDownDecompressor()
-            
-            bytesInFile = 0
-            
-            switch headerType {
-            case .none:
-                break
-                
-            case .localFile:
-                fillLocalHeader()
-                break
-                
-            case .dataDescriptor:
-                skipDataDescriptor()
-                break
-                
-            case .archiveExtraData:
-                currentState = .finished
-                break
-                
-            case .centralDirectory:
-                currentState = .finished
-                break
-            }
-        }
-    }
-    
-    func decompress(data buffer: Data, finished: Bool) {
-        guard let destinationBufferPointer,
-              let streamPointer else {
-            return
-        }
-        
-        let count = buffer.count
-        var flags = Int32(0)
-        
-        if finished {
-            flags = Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
-        }
-        
-        streamPointer.pointee.src_size = count
-        
-        // Process everything in the buffer
-        var status: compression_status = COMPRESSION_STATUS_OK
-        repeat {
-            if streamPointer.pointee.src_size == 0 {
-                return
-            }
-            
-            buffer.withUnsafeBytes {
-                let baseAddress = $0.bindMemory(to: UInt8.self).baseAddress!
-                streamPointer.pointee.src_ptr = baseAddress.advanced(by: count - streamPointer.pointee.src_size)
-                
-                status = compression_stream_process(streamPointer, flags)
-            }
-            
-            switch status {
-            case COMPRESSION_STATUS_OK, COMPRESSION_STATUS_END:
-                let dataCount = Zipper.bufferSize - streamPointer.pointee.dst_size
-                
-                let outputData = Data(bytesNoCopy: destinationBufferPointer,
-                                      count: dataCount,
-                                      deallocator: .none)
-                
-                delegate.writeData(outputData, bytesDownloaded)
-                
-                streamPointer.pointee.dst_ptr = destinationBufferPointer
-                streamPointer.pointee.dst_size = Zipper.bufferSize
-                break
-                
-            case COMPRESSION_STATUS_ERROR:
-                delegate.errorDidOccur(.compressorError)
-                break
-                
-            default:
-                break
-            }
-        } while status == COMPRESSION_STATUS_OK
-    }
-    
-    func extractUInt16(from data: UnsafeMutablePointer<UInt8>, at position: Int) -> UInt16 {
-        var value: UInt16 = 0
-        value = UInt16(data[position + 1])
-        value = value << 8
+    func extractUInt16(from data: Data, at position: Int) -> UInt16 {
+        var value: UInt16
+        value = UInt16(data[position + 1]) << 8
         value = value | UInt16(data[position])
         return value
     }
-    
-    func extractUInt32(from data: UnsafeMutablePointer<UInt8>, at position: Int) -> UInt32 {
+
+    func extractUInt32(from data: Data, at position: Int) -> UInt32 {
         var value: UInt32 = 0
         
         value = UInt32(data[position + 3]) << 24
         value = value | UInt32(data[position + 2]) << 16
         value = value | UInt32(data[position + 1]) << 8
-        value = value | UInt32(data[position])
+        value = value | UInt32(data[position + 0])
         
         return value
     }
