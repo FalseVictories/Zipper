@@ -24,3 +24,14 @@ let package = Package(
             dependencies: ["Zipper"]),
     ]
 )
+
+let swiftSettings: [SwiftSetting] = [
+    .enableExperimentalFeature("StrictConcurrency"),
+    .enableUpcomingFeature("DisableOutwardActorInference"),
+]
+
+for target in package.targets {
+    var settings = target.swiftSettings ?? []
+    settings.append(contentsOf: swiftSettings)
+    target.swiftSettings = settings
+}
