@@ -147,7 +147,6 @@ private extension Zipper {
                 
                 if context.bytesToFillOrSkip == 0 {
                     if let workBuffer = context.workBuffer {
-                        context.workBuffer = nil
                         context.workBufferOffset = 0
                         
                         parseBuffer(context, workBuffer)
@@ -191,7 +190,7 @@ private extension Zipper {
         let bytesFromCurrentBuffer  = Int(min(UInt32(currentBuffer.count - offset),
                                               context.bytesToFillOrSkip))
         for idx in 0..<bytesFromCurrentBuffer {
-            workBuffer.insert(currentBuffer[offset + idx], at: context.workBufferOffset)
+            context.workBuffer?.insert(currentBuffer[offset + idx], at: context.workBufferOffset)
             context.workBufferOffset += 1
             context.bytesToFillOrSkip -= 1
         }
