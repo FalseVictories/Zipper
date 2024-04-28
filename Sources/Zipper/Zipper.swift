@@ -183,7 +183,7 @@ private extension Zipper {
     func fillWorkBuffer(from currentBuffer: Data,
                         at offset: Int,
                         with context: Context) throws -> Int {
-        guard var workBuffer = context.workBuffer else {
+        guard context.workBuffer != nil else {
             throw ZipperError.invalidState
         }
         
