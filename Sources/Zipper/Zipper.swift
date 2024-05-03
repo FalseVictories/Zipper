@@ -23,14 +23,14 @@ public struct ZipperDelegate: @unchecked Sendable {
     var createFolder: (String) throws -> Void
     var beginWritingFile: (String) throws -> Void
     var writeData: (Data, Int64) throws -> Void
-    var endWritingFile: () throws -> Void
+    var endWritingFile: (String) throws -> Void
     var didFinish: () -> Void
     var errorDidOccur: (ZipperError) -> Void
     
     public init(createFolder: @escaping (String) -> Void,
                 beginWritingFile: @escaping (String) -> Void,
                 writeData: @escaping (Data, Int64) -> Void,
-                endWritingFile: @escaping () -> Void,
+                endWritingFile: @escaping (String) -> Void,
                 didFinish: @escaping () -> Void,
                 errorDidOccur: @escaping (ZipperError) -> Void) {
         self.createFolder = createFolder
@@ -168,7 +168,7 @@ private extension Zipper {
                                               with: context)
                 
                 if context.bytesToFillOrSkip == 0 {
-                    try delegate.endWritingFile()
+                    try delegate.endWritingFile(context.currentFilename)
                     
                     resetForNextEntry(with: context)
                 }
